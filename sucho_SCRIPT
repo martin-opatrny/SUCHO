@@ -1,0 +1,198 @@
+import os
+import logging
+from osgeo import gdal, ogr, osr
+from datetime import datetime
+import subprocess
+
+# Nastavení logování
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(message)s')
+
+# Cesty k souborům
+tiff_path = r"D:\OneDrive - CZU v Praze\SPS\Projekty\Agrometeorologie_cz\Sucho\Data\Sucho-ze-serveru\SUCHO_20240326.tif"
+shp_path = r"D:\OneDrive - CZU v Praze\SPS\Projekty\Agrometeorologie_cz\Sucho\Data\SHP\VYBRANY_POZEMEK_TIF.cpg.shp"
+output_dir = r"D:\OneDrive - CZU v Praze\SPS\Projekty\Agrometeorologie_cz\Sucho\Data\Save"
+
+def get_coordinate_system(file_path):
+    ds = gdal.Open(file_path) if file_path.endswith('.tif') else ogr.Open(file_path)
+    if ds is None:
+        logging.error(f"Nelze otevřít soubor: {file_path}")
+        return None
+
+    if file_path.endswith('.tif'):
+        proj = ds.GetProjection()
+    else:
+        layer = ds.GetLayer()
+        proj = layer.GetSpatialRef().ExportToWkt()
+
+    srs = osr.SpatialReference()
+    srs.ImportFromWkt(proj)
+    return srs
+
+def check_coordinate_system(file_path, expected_epsg):
+    srs = get_coordinate_system(file_path)
+    if srs is None:
+        return False
+    if srs.GetAuthorityCode(None) != str(expected_epsg):
+        logging.error(f"Soubor {file_path} nemá očekávaný koordinační systém EPSG:{expected_epsg}.")
+        return False
+    return True
+
+def convert_tiff_to_shp(tiff_path, output_dir):
+    current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
+    shp_output_path = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(tiff_path))[0]}_{current_datetime}.shp")
+    
+    logging.info(f"Převod TIFF na SHP: {tiff_path} -> {shp_output_path}")
+
+    src_ds = gdal.Open(tiff_path)
+    if src_ds is None:
+        logging.error(f"Nelze otevřít TIFF soubor: {tiff_path}")
+        return None
+    
+    srcband = src_ds.GetRasterBand(1)
+    srs = osr.SpatialReference()
+    srs.ImportFromWkt(src_ds.GetProjectionRef())
+    
+    drv = ogr.GetDriverByName("ESRI Shapefile")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    if os.path.exists(shp_output_path):
+        drv.DeleteDataSource(shp_output_path)
+    dst_ds = drv.CreateDataSource(shp_output_path)
+    
+    if dst_ds is None:
+        logging.error(f"Nelze vytvořit výstupní shapefile: {shp_output_path}")
+        return None
+    
+    dst_layer = dst_ds.CreateLayer(os.path.splitext(os.path.basename(shp_output_path))[0], srs=srs, geom_type=ogr.wkbPolygon)
+    
+    # Přidání atributů
+    dst_layer.CreateField(ogr.FieldDefn("ID", ogr.OFTInteger))
+    dst_layer.CreateField(ogr.FieldDefn("BAND1", ogr.OFTInteger))
+    dst_layer.CreateField(ogr.FieldDefn("SUCHO", ogr.OFTInteger))
+    
+    options = ['BAND=1']
+    
+    # Provádění polygonizace a přidání hodnot do polí
+    gdal.Polygonize(srcband, None, dst_layer, 1, options, callback=None)
+    
+    # Přidání unikátního ID a kopírování hodnot z "BAND1" do "SUCHO"
+    for i, feature in enumerate(dst_layer):
+        feature.SetField("ID", i + 1)
+        band1_value = feature.GetFieldAsInteger("BAND1")
+        logging.info(f"Prvek ID {i+1}: BAND1={band1_value}")
+        if band1_value is None:
+            logging.warning(f"Hodnota BAND1 je NULL pro prvek ID {i+1}")
+        feature.SetField("SUCHO", band1_value)
+        dst_layer.SetFeature(feature)
+    
+    dst_ds = None
+    src_ds = None
+    return shp_output_path
+
+def ensure_sucho_field(shp_path):
+    ds = ogr.Open(shp_path, 1)  # Otevřít shapefile v režimu pro zápis
+    if ds is None:
+        logging.error(f"Nelze otevřít soubor: {shp_path}")
+        return False
+
+    layer = ds.GetLayer()
+    layer_defn = layer.GetLayerDefn()
+    field_names = [layer_defn.GetFieldDefn(i).GetName() for i in range(layer_defn.GetFieldCount())]
+
+    if "SUCHO" not in field_names:
+        logging.info(f"Přidávání pole 'SUCHO' do souboru: {shp_path}")
+        new_field = ogr.FieldDefn("SUCHO", ogr.OFTInteger)
+        layer.CreateField(new_field)
+
+    ds = None
+    return True
+
+def intersect_shapefiles(shp1, shp2, output_dir):
+    current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_shp = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(shp1))[0]}_intersection_{current_datetime}.shp")
+    
+    logging.info(f"Provádění intersectu: {shp1} + {shp2} -> {output_shp}")
+
+    try:
+        subprocess.run([
+            "ogr2ogr",
+            "-f", "ESRI Shapefile",
+            output_shp,
+            shp1,
+            "-clipsrc", shp2,
+            "-overwrite"
+        ], check=True)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Intersect selhal: {e}")
+        return None
+
+    return output_shp
+
+def check_sucho_values(shp_path):
+    ds = ogr.Open(shp_path)
+    if ds is None:
+        logging.error(f"Nelze otevřít soubor: {shp_path}")
+        return
+
+    layer = ds.GetLayer()
+    for feature in layer:
+        sucho_value = feature.GetField("SUCHO")
+        if sucho_value is not None:
+            logging.info(f"Polygon ID {feature.GetFID()}: SUCHO={sucho_value}")
+        else:
+            logging.warning(f"Polygon ID {feature.GetFID()}: Hodnota SUCHO není dostupná")
+
+if __name__ == "__main__":
+    logging.info("Začátek zpracování")
+
+    logging.info(f"Vstupní TIFF: {tiff_path}")
+    logging.info(f"Vstupní shapefile: {shp_path}")
+
+    # Získání a výpis souřadnicových systémů
+    tiff_srs = get_coordinate_system(tiff_path)
+    shp_srs = get_coordinate_system(shp_path)
+
+    if tiff_srs is not None:
+        logging.info(f"Souřadnicový systém TIFF souboru: {tiff_srs.ExportToProj4()}")
+    else:
+        logging.error("Nelze získat souřadnicový systém TIFF souboru.")
+
+    if shp_srs is not None:
+        logging.info(f"Souřadnicový systém shapefile souboru: {shp_srs.ExportToProj4()}")
+    else:
+        logging.error("Nelze získat souřadnicový systém shapefile souboru.")
+
+    # Kontrola koordinačních systémů
+    if not check_coordinate_system(tiff_path, 32633):
+        logging.error("TIFF soubor nemá očekávaný koordinační systém. Ukončuji zpracování.")
+        exit(1)
+
+    if not check_coordinate_system(shp_path, 32633):
+        logging.error("Shapefile nemá očekávaný koordinační systém. Ukončuji zpracování.")
+        exit(1)
+
+    tiff_shp_path = convert_tiff_to_shp(tiff_path, output_dir)
+
+    if tiff_shp_path is None:
+        logging.error("Převod TIFF na SHP selhal. Ukončuji zpracování.")
+        exit(1)
+
+    logging.info(f"TIFF převeden na SHP: {tiff_shp_path}")
+
+    # Zajistit, že vstupní shapefile obsahuje pole 'SUCHO'
+    if not ensure_sucho_field(shp_path):
+        logging.error("Nelze zajistit pole 'SUCHO' ve vstupním shapefile. Ukončuji zpracování.")
+        exit(1)
+
+    output_shp_path = intersect_shapefiles(shp_path, tiff_shp_path, output_dir)
+
+    if output_shp_path is None:
+        logging.error("Intersect selhal. Ukončuji zpracování.")
+        exit(1)
+
+    logging.info(f"Intersect dokončen. Výstup: {output_shp_path}")
+
+    # Kontrola hodnoty SUCHO po intersection
+    check_sucho_values(output_shp_path)
+
+    logging.info("Zpracování dokončeno")
