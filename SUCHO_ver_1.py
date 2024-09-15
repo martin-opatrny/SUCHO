@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 st.set_page_config(page_title="Prohlížeč dat o suchu", layout="wide")
 
 # Konstanty
-SQL_FILE_PATH = r"D:\OneDrive - CZU v Praze\SPS\Projekty\Agrometeorologie_cz\Sucho\Data\Save\Output\pozemky_data.sql"
+SQL_FILE_PATH = "pozemky_data.sql"
 DATABASE_NAME = "sucho_database.db"
 
 # Inicializace session state
